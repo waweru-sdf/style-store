@@ -203,3 +203,162 @@ def test_admin_requires_token_and_restocks_on_refund(mock):
     assert stock_of(c, "ribbed-knit-top", v["id"]) == 10
     c.patch(f"/api/admin/orders/{ref}", json={"status": "cancelled"}, headers=hdr)
     assert stock_of(c, "ribbed-knit-top", v["id"]) == 10  # restocked only once
+
+
+# ---------------------------------------------------------------- admin additions
+ADMIN = {"X-Admin-Token": "admintok"}
+
+
+def new_product(**overrides):
+    body = {"name": "Linen Wrap Skirt", "collection": "women", "price": 2900, "description": "Light and airy.",
+            "sizes": ["S", "M"], "colours": ["Sand", "Black"], "fulfilment": "local", "stock": 5}
+    body.update(overrides)
+    return body
+
+
+def test_admin_adds_product_and_it_shows_in_shop(mock):
+    _, c = mock
+    res = c.post("/api/admin/products", json=new_product(), headers=ADMIN)
+    assert res.status_code == 201
+    created = res.get_json()
+    assert created["slug"] == "linen-wrap-skirt" and created["price"] == 2900
+    assert len(created["variants"]) == 4  # 2 sizes x 2 colours
+    assert all(v["stock"] == 5 for v in created["variants"])
+    assert len({v["sku"] for v in created["variants"]}) == 4
+    shop = c.get("/api/products?collection=women").get_json()
+    assert "linen-wrap-skirt" in [p["slug"] for p in shop]
+    # new items show first under "new arrivals"
+    assert c.get("/api/products?sort=new").get_json()[0]["slug"] == "linen-wrap-skirt"
+
+
+def test_new_product_can_be_bought_and_stock_drops(mock):
+    _, c = mock
+    created = c.post("/api/admin/products", json=new_product(), headers=ADMIN).get_json()
+    vid = created["variants"][0]["id"]
+    ref = place_order(c, vid, qty=2).get_json()["reference"]
+    c.post(f"/api/mock/pay/{ref}", json={"outcome": "success"})
+    assert c.post(f"/api/orders/{ref}/verify").get_json()["status"] == "paid"
+    assert stock_of(c, "linen-wrap-skirt", vid) == 3
+
+
+def test_supplier_product_has_no_tracked_stock(mock):
+    _, c = mock
+    created = c.post("/api/admin/products", json=new_product(fulfilment="supplier", stock=50), headers=ADMIN).get_json()
+    assert all(v["stock"] is None and v["fulfilment"] == "supplier" for v in created["variants"])
+
+
+def test_add_product_requires_token_and_valid_input(mock):
+    _, c = mock
+    assert c.post("/api/admin/products", json=new_product()).status_code == 401
+    for bad in (new_product(collection="shoes"), new_product(price="abc"), new_product(price=0),
+                new_product(sizes=[]), new_product(colours=" , "), new_product(name="x"),
+                new_product(fulfilment="drone"), new_product(stock=-1)):
+        assert c.post("/api/admin/products", json=bad, headers=ADMIN).status_code == 400
+    ok = c.post("/api/admin/products", json=new_product(sizes="S, M, m, L", colours="Sand"), headers=ADMIN)
+    assert ok.status_code == 201 and ok.get_json()["sizes"] == ["S", "M", "L"]  # comma string, duplicates dropped
+
+
+def test_same_name_gets_a_unique_slug(mock):
+    _, c = mock
+    a = c.post("/api/admin/products", json=new_product(), headers=ADMIN).get_json()
+    b = c.post("/api/admin/products", json=new_product(), headers=ADMIN).get_json()
+    assert a["slug"] == "linen-wrap-skirt" and b["slug"] == "linen-wrap-skirt-2"
+
+
+def test_summary_counts_payments(mock):
+    _, c = mock
+    v = first_local_variant(c)
+    assert c.get("/api/admin/summary").status_code == 401
+    paid = place_order(c, v["id"], qty=2).get_json()  # 3000 + 250
+    c.post(f"/api/mock/pay/{paid['reference']}", json={"outcome": "success"})
+    c.post(f"/api/orders/{paid['reference']}/verify")
+    failed = place_order(c, v["id"]).get_json()["reference"]
+    c.post(f"/api/mock/pay/{failed}", json={"outcome": "failed"})
+    c.post(f"/api/orders/{failed}/verify")
+    place_order(c, v["id"])  # stays pending
+    s = c.get("/api/admin/summary", headers=ADMIN).get_json()
+    assert s["collected"] == 3250 and s["paid_orders"] == 1 and s["refunded"] == 0
+    assert s["pending"] == 1 and s["failed"] == 1 and s["under_review"] == 0 and s["total_orders"] == 3
+    ref = paid["reference"]
+    c.patch(f"/api/admin/orders/{ref}", json={"status": "refunded", "refund_reference": "RF-123"}, headers=ADMIN)
+    s = c.get("/api/admin/summary", headers=ADMIN).get_json()
+    assert s["collected"] == 0 and s["refunded"] == 3250
+
+
+def test_refund_reference_is_recorded(mock):
+    _, c = mock
+    v = first_local_variant(c)
+    ref = place_order(c, v["id"]).get_json()["reference"]
+    c.post(f"/api/mock/pay/{ref}", json={"outcome": "success"})
+    c.post(f"/api/orders/{ref}/verify")
+    r = c.patch(f"/api/admin/orders/{ref}", json={"status": "refunded", "refund_reference": "RF-999"}, headers=ADMIN)
+    body = r.get_json()
+    assert body["status"] == "refunded" and body["refund_reference"] == "RF-999"
+    assert any(e["kind"] == "refund_recorded" for e in body["events"])
+
+
+def make_review_order(c, qty=1):
+    """A payment that arrives with the wrong amount lands in payment_review."""
+    v = first_local_variant(c)
+    ref = place_order(c, v["id"], qty=qty).get_json()["reference"]
+    signed_post(c, {"event": "charge.success", "data": {"id": 41, "reference": ref, "amount": 100, "currency": "KES"}})
+    assert c.get(f"/api/orders/{ref}").get_json()["status"] == "payment_review"
+    return ref, v
+
+
+def test_review_orders_cannot_be_released_by_webhook_or_verify(live):
+    _, c, calls = live
+    ref, v = make_review_order(c)
+    # even a later, correct-looking notification must not release it: a person decides
+    signed_post(c, {"event": "charge.success", "data": {"id": 42, "reference": ref, "amount": 175000, "currency": "KES"}})
+    calls["verify_result"] = {"status": "success", "reference": ref, "amount": 175000, "currency": "KES"}
+    assert c.post(f"/api/orders/{ref}/verify").get_json()["status"] == "payment_review"
+    assert stock_of(c, "ribbed-knit-top", v["id"]) == 10
+
+
+def test_admin_can_approve_a_payment_under_review(live):
+    _, c, _ = live
+    ref, v = make_review_order(c, qty=2)
+    r = c.post(f"/api/admin/orders/{ref}/resolve-payment", json={"action": "approve", "note": "Checked in Paystack"}, headers=ADMIN)
+    body = r.get_json()
+    assert body["status"] == "paid"
+    assert stock_of(c, "ribbed-knit-top", v["id"]) == 8
+    kinds = [e["kind"] for e in body["events"]]
+    assert "review_approved" in kinds and "payment_verified" in kinds
+    # resolving twice is refused and does not deduct stock again
+    again = c.post(f"/api/admin/orders/{ref}/resolve-payment", json={"action": "approve"}, headers=ADMIN)
+    assert again.status_code == 400
+    assert stock_of(c, "ribbed-knit-top", v["id"]) == 8
+
+
+def test_admin_can_reject_a_payment_under_review(live):
+    _, c, _ = live
+    ref, v = make_review_order(c)
+    r = c.post(f"/api/admin/orders/{ref}/resolve-payment", json={"action": "reject", "note": "Wrong amount"}, headers=ADMIN)
+    assert r.get_json()["status"] == "payment_failed"
+    assert stock_of(c, "ribbed-knit-top", v["id"]) == 10
+    assert c.post(f"/api/admin/orders/{ref}/resolve-payment", json={"action": "maybe"}, headers=ADMIN).status_code == 400
+    assert c.post(f"/api/admin/orders/{ref}/resolve-payment", json={"action": "approve"}).status_code == 401
+
+
+def test_only_review_orders_can_be_resolved(mock):
+    _, c = mock
+    v = first_local_variant(c)
+    ref = place_order(c, v["id"]).get_json()["reference"]  # still pending
+    r = c.post(f"/api/admin/orders/{ref}/resolve-payment", json={"action": "approve"}, headers=ADMIN)
+    assert r.status_code == 400
+    assert c.get(f"/api/orders/{ref}").get_json()["status"] == "pending_payment"
+
+
+def test_old_database_gets_refund_reference_column(tmp_path):
+    import sqlite3
+    from app import SCHEMA
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript(SCHEMA.replace("refund_reference TEXT, ", ""))
+    old.commit()
+    old.close()
+    app = create_app({"DATABASE": str(path), "TESTING": True, "ADMIN_TOKEN": "admintok"})
+    cols = {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(orders)")}
+    assert "refund_reference" in cols
+    assert app.test_client().get("/api/products").status_code == 200
