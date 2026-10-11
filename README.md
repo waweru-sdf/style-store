@@ -45,9 +45,9 @@ Paystack's Kenya support, methods and fees depend on your merchant account. Conf
 
 ## What's built vs. next steps
 
-Built: home with hero, 4 collections with sort/size/stock filters, product page (colour/size, size guide, stock and dispatch info), cart, guest checkout with delivery zones and a discount code (`STYLE10`), order status page, info/policy pages, minimal order desk (status, tracking number, refund/cancel with restock), hybrid inventory (SKU, cost, stock, local vs supplier fulfilment).
+Built: home with hero, 4 collections with sort/size/stock filters, product page (colour/size, size guide, stock and dispatch info), cart, guest checkout with delivery zones and a discount code (`STYLE10`), order status page, info/policy pages, an order desk at `/admin` with three tabs: **Orders** (what was ordered, filters and search, status, tracking, supplier-check reminder), **Payments** (collected/refunded/pending/failed totals, approve or reject payments under review, refund reference) and **Add product** (new listing items with sizes, colours, stock and fulfilment type), hybrid inventory (SKU, cost, stock, local vs supplier fulfilment).
 
-Not built yet (out of scope for 3 hours): real emails/SMS (swap the body of `notify()` in `app.py`), product/stock editing screens in admin (use the DB for now), customer accounts, real refunds through the Paystack API (admin marks refunded; refund the money in the Paystack dashboard), courier API, product photos (placeholders are shown), analytics.
+Not built yet (out of scope for 3 hours): real emails/SMS (swap the body of `notify()` in `app.py`), editing existing products and stock in admin (adding products is built), product photo upload, customer accounts, real refunds through the Paystack API (admin marks refunded; refund the money in the Paystack dashboard), courier API, product photos (placeholders are shown), analytics.
 
 Placeholders to replace before launch: contact email in `frontend/src/pages/Info.jsx`, the policy wording (have it reviewed), bestseller picks (curated list in `Home.jsx` until there is sales data).
 
