@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS orders (
   customer_name TEXT, email TEXT, phone TEXT, address TEXT, town TEXT, county TEXT,
   zone TEXT, subtotal INTEGER, delivery_fee INTEGER, discount INTEGER, total INTEGER,
   discount_code TEXT, payment_mode TEXT, authorization_url TEXT, mock_outcome TEXT,
-  tracking_number TEXT, restocked INTEGER NOT NULL DEFAULT 0,
+  tracking_number TEXT, refund_reference TEXT, restocked INTEGER NOT NULL DEFAULT 0,
   created_at TEXT, paid_at TEXT
 );
 CREATE TABLE IF NOT EXISTS order_items (
@@ -175,6 +175,10 @@ def create_app(config=None):
     def init_db():
         db = sqlite3.connect(app.config["DATABASE"])
         db.executescript(SCHEMA)
+        # Small migration: databases created before refund_reference existed get the column added.
+        order_cols = {r[1] for r in db.execute("PRAGMA table_info(orders)")}
+        if "refund_reference" not in order_cols:
+            db.execute("ALTER TABLE orders ADD COLUMN refund_reference TEXT")
         if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
             seed(db)
         db.commit()
@@ -305,6 +309,7 @@ def create_app(config=None):
         }
         if not public:
             data["phone"] = order["phone"]
+            data["refund_reference"] = order["refund_reference"]
             data["events"] = [dict(e) for e in db.execute(
                 "SELECT at, kind, detail FROM order_events WHERE order_id=? ORDER BY id", (order["id"],))]
         return data
@@ -324,11 +329,17 @@ def create_app(config=None):
                 db.execute("UPDATE variants SET stock = stock + ? WHERE id=?", (it["quantity"], it["variant_id"]))
         db.execute("UPDATE orders SET restocked=1 WHERE id=?", (order["id"],))
 
-    def mark_paid(db, order, source):
-        """Idempotent: only the first successful call flips the order and deducts stock."""
+    def mark_paid(db, order, source, from_review=False):
+        """Idempotent: only the first successful call flips the order and deducts stock.
+
+        Orders under review (payment_review) are only released by a person: from_review=True is
+        passed by the admin approve action, never by verify or the webhook.
+        """
+        states = ("pending_payment", "payment_failed") + (("payment_review",) if from_review else ())
+        marks = ",".join("?" * len(states))
         cur = db.execute(
-            "UPDATE orders SET status='paid', paid_at=? WHERE id=? AND status IN ('pending_payment','payment_failed')",
-            (now(), order["id"]))
+            f"UPDATE orders SET status='paid', paid_at=? WHERE id=? AND status IN ({marks})",
+            (now(), order["id"], *states))
         if cur.rowcount == 0:
             log_event(db, order["id"], "payment_duplicate_ignored", f"source={source}")
             return False
@@ -620,11 +631,134 @@ def create_app(config=None):
             db.execute("UPDATE orders SET status=? WHERE id=?", (status, order["id"]))
             if status in ("cancelled", "refunded"):
                 restock(db, order)
+            if status == "refunded" and body.get("refund_reference"):
+                ref_code = str(body["refund_reference"]).strip()[:80]
+                db.execute("UPDATE orders SET refund_reference=? WHERE id=?", (ref_code, order["id"]))
+                log_event(db, order["id"], "refund_recorded", ref_code)
             log_event(db, order["id"], "status_changed", f"{order['status']} -> {status}")
             notify(db, order, f"Order {order['reference']} is now {status}",
                    f"Hi {order['customer_name']}, your order {order['reference']} is now {status}.")
         db.commit()
         return jsonify(order_dict(db, load_order(db, reference), public=False))
+
+    @app.get("/api/admin/summary")
+    def admin_summary():
+        """Payment overview for the Payments tab. Amounts are whole KES."""
+        require_admin()
+        row = get_db().execute(
+            """SELECT
+                 COALESCE(SUM(CASE WHEN paid_at IS NOT NULL AND status != 'refunded' THEN total END), 0) AS collected,
+                 COALESCE(SUM(CASE WHEN status = 'refunded' THEN total END), 0) AS refunded,
+                 COALESCE(SUM(paid_at IS NOT NULL), 0) AS paid_orders,
+                 COALESCE(SUM(status = 'pending_payment'), 0) AS pending,
+                 COALESCE(SUM(status = 'payment_failed'), 0) AS failed,
+                 COALESCE(SUM(status = 'payment_review'), 0) AS under_review,
+                 COUNT(*) AS total_orders
+               FROM orders""").fetchone()
+        return jsonify({**dict(row), "currency": CURRENCY})
+
+    @app.post("/api/admin/orders/<reference>/resolve-payment")
+    def admin_resolve_payment(reference):
+        """A person decides an order whose payment did not match (status payment_review)."""
+        require_admin()
+        db = get_db()
+        order = load_order(db, reference)
+        body = request.get_json(silent=True) or {}
+        action = body.get("action")
+        note = str(body.get("note", "")).strip()[:200]
+        if action not in ("approve", "reject"):
+            raise ApiError("action must be approve or reject.")
+        if order["status"] != "payment_review":
+            raise ApiError("Only orders under payment review can be resolved here.")
+        if action == "approve":
+            mark_paid(db, order, "admin", from_review=True)
+            log_event(db, order["id"], "review_approved", note)
+        else:
+            db.execute("UPDATE orders SET status='payment_failed' WHERE id=?", (order["id"],))
+            log_event(db, order["id"], "review_rejected", note)
+        db.commit()
+        return jsonify(order_dict(db, load_order(db, reference), public=False))
+
+    def slugify(text):
+        return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60] or "item"
+
+    def clean_list(value, label, max_items=12):
+        """Accepts a list or a comma-separated string; trims, drops blanks and case-insensitive duplicates."""
+        if isinstance(value, str):
+            value = value.split(",")
+        if not isinstance(value, list):
+            raise ApiError(f"Please give at least one {label}.")
+        out, seen = [], set()
+        for item in value:
+            item = str(item).strip()
+            if not item:
+                continue
+            key = re.sub(r"[^A-Z0-9]", "", item.upper())
+            if len(item) > 24 or not key:
+                raise ApiError(f"Each {label} must be 1-24 characters (letters or numbers).")
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+        if not 1 <= len(out) <= max_items:
+            raise ApiError(f"Please give between 1 and {max_items} {label}s.")
+        return out
+
+    def whole_number(value, label, low, high):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            raise ApiError(f"{label} must be a whole number.")
+        if not low <= number <= high:
+            raise ApiError(f"{label} must be between {low:,} and {high:,}.")
+        return number
+
+    @app.post("/api/admin/products")
+    def admin_create_product():
+        """Adds a product to the listing: one variant per size x colour, visible on the shop at once."""
+        require_admin()
+        db = get_db()
+        b = request.get_json(silent=True) or {}
+        name = str(b.get("name", "")).strip()
+        if not 2 <= len(name) <= 100:
+            raise ApiError("Product name must be 2-100 characters.")
+        coll = b.get("collection")
+        if coll not in COLLECTIONS:
+            raise ApiError("Choose a valid collection.")
+        price = whole_number(b.get("price"), "Price (KES)", 1, 1_000_000)
+        cost_raw = b.get("cost")
+        cost = int(price * 0.55) if cost_raw in (None, "") else whole_number(cost_raw, "Cost (KES)", 0, 1_000_000)
+        desc = str(b.get("description", "")).strip()[:1000]
+        fulfil = b.get("fulfilment", "local")
+        if fulfil not in ("local", "supplier"):
+            raise ApiError("Fulfilment must be local or supplier.")
+        sizes = clean_list(b.get("sizes"), "size")
+        colours = clean_list(b.get("colours"), "colour")
+        stock = 0 if fulfil == "supplier" else whole_number(b.get("stock", 0), "Stock", 0, 9999)
+
+        base = slugify(name)
+        slug, n = base, 2
+        while db.execute("SELECT 1 FROM products WHERE slug=?", (slug,)).fetchone():
+            slug, n = f"{base}-{n}", n + 1
+        estimate = ("Dispatched in 1-2 working days" if fulfil == "local"
+                    else "Supplier confirms availability. Dispatch in 5-8 working days")
+        try:
+            cur = db.execute(
+                "INSERT INTO products (slug, name, collection, price, description, created_at) VALUES (?,?,?,?,?,?)",
+                (slug, name, coll, price, desc, now()))
+            pid = cur.lastrowid
+            for size in sizes:
+                for colour in colours:
+                    sku = (f"STY-{coll[:3].upper()}-{pid:02d}-{re.sub('[^A-Z0-9]', '', size.upper())}"
+                           f"-{re.sub('[^A-Z0-9]', '', colour.upper())}")
+                    db.execute(
+                        "INSERT INTO variants (product_id, sku, size, colour, cost, stock, fulfilment, dispatch_estimate) "
+                        "VALUES (?,?,?,?,?,?,?,?)", (pid, sku, size, colour, cost, stock, fulfil, estimate))
+            db.commit()
+        except sqlite3.IntegrityError:
+            db.rollback()
+            raise ApiError("Those sizes and colours clash with an existing item. Please adjust them.")
+        row = db.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+        return jsonify(product_dict(db, row, with_variants=True)), 201
 
     init_db()
     return app
